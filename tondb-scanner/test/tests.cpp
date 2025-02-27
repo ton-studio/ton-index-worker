@@ -89,6 +89,7 @@ TEST(TonDbScanner, ParseBurnWithCustomPayload) {
         ASSERT_EQ(convert::to_raw_address(transaction.account), burn.jetton_wallet);
         ASSERT_EQ(jetton_master.jetton, burn.jetton_master);
         ASSERT_EQ(6083770390284902059, burn.query_id);
+        
         CHECK(td::BigIntG<257>(8267792794) == **burn.amount.get());
       });
        td::actor::send_closure(jetton_wallet_detector, &JettonWalletDetector::parse_burn, transaction, message_payload, std::move(P));   

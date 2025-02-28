@@ -89,6 +89,8 @@ TEST(TonDbScanner, JettonWalletDetector_parse_burn) {
       ASSERT_EQ(convert::to_raw_address(transaction.account), burn.jetton_wallet);
       ASSERT_EQ(jetton_master.jetton, burn.jetton_master);
       ASSERT_EQ(6083770390284902059, burn.query_id);
+      ASSERT_TRUE(burn.custom_payload.not_null());
+      ASSERT_EQ("A3FBB2B6DF19CEAA089D2794A26845822A2284D59B277469D167FFC19D00E44B", burn.custom_payload->get_hash().to_hex());
       CHECK(td::BigIntG<257>(8267792794) == **burn.amount.get());
     });
     td::actor::send_closure(jetton_wallet_detector, &JettonWalletDetector::parse_burn, transaction, message_payload, std::move(P));

@@ -61,15 +61,15 @@ void InsertManagerBase::schedule_next_insert_batches(bool full_batch = false)
 
         std::vector<InsertTaskStruct> batch;
         QueueState batch_state{0, 0, 0, 0};
-        while(!insert_queue_.empty() && check_batch_size(batch_state)) {
-            auto task = std::move(insert_queue_.front());
-            insert_queue_.pop();
+        // while(!insert_queue_.empty() && check_batch_size(batch_state)) {
+        auto task = std::move(insert_queue_.front());
+        insert_queue_.pop();
 
-            QueueState loc_state = task.get_queue_state();
-            batch_state += loc_state;
-            queue_state_ -= loc_state;
-            batch.push_back(std::move(task));
-        }
+        QueueState loc_state = task.get_queue_state();
+        batch_state += loc_state;
+        queue_state_ -= loc_state;
+        batch.push_back(std::move(task));
+        // }
         auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R){
             if(R.is_error()) {
                 LOG(ERROR) << "Failed to insert batch: " << R.move_as_error();

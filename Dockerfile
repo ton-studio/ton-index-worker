@@ -25,7 +25,7 @@ COPY sandbox-cpp/ /app/sandbox-cpp/
 COPY CMakeLists.txt /app/
 
 WORKDIR /app/build
-RUN cmake -DCMAKE_BUILD_TYPE=Release -DSKIP_TESTS=On ..
+RUN cmake -DCMAKE_BUILD_TYPE=Release -DPORTABLE=1 -DSKIP_TESTS=On ..
 RUN touch /app/suppression_mappings.txt && make -j$(nproc)
 
 FROM ubuntu:24.04

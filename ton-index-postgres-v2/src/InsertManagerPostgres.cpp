@@ -1,4 +1,5 @@
 #include <mutex>
+#include <chrono>
 #include "td/utils/JsonBuilder.h"
 #include "InsertManagerPostgres.h"
 #include "convert-utils.h"
@@ -83,18 +84,29 @@ void InsertBatchPostgres::start_up() {
 
 
 void InsertBatchPostgres::alarm() {
+  using clock = std::chrono::steady_clock;
+  auto ms_since = [](clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+  };
+  auto t_start = clock::now();
+  std::int64_t conn_ms = 0, non_mutex_ms = 0, build_ms = 0;
+  std::int64_t mutex_wait_ms = 0, mutex_exec_ms = 0, commit_ms = 0;
+  std::size_t under_mutex_size = 0, las_size = 0, traces_size = 0;
+
   try {
+    auto t_conn_start = clock::now();
     pqxx::connection c(connection_string_);
     if (!c.is_open()) {
       promise_.set_error(td::Status::Error(ErrorCode::DB_ERROR, "Failed to open database"));
       return;
     }
+    conn_ms = ms_since(t_conn_start);
 
     // update account states
     pqxx::work txn(c);
 
-    // prepare queries
-    std::string insert_under_mutex_query;
+    // non-mutex inserts (execute immediately into own transaction)
+    auto t_non_mutex_start = clock::now();
     insert_blocks(txn);
     insert_shard_state(txn);
     insert_transactions(txn);
@@ -106,26 +118,72 @@ void InsertBatchPostgres::alarm() {
     insert_jetton_transfers(txn);
     insert_jetton_burns(txn);
     insert_nft_transfers(txn);
+    non_mutex_ms = ms_since(t_non_mutex_start);
+
+    // build under-mutex query (string concatenation, CPU-bound)
+    auto t_build_start = clock::now();
+    std::string insert_under_mutex_query;
     insert_under_mutex_query += insert_jetton_masters(txn);
     insert_under_mutex_query += insert_jetton_wallets(txn);
     insert_under_mutex_query += insert_nft_collections(txn);
     insert_under_mutex_query += insert_nft_items(txn);
     insert_under_mutex_query += insert_getgems_nft_auctions(txn);
     insert_under_mutex_query += insert_getgems_nft_sales(txn);
-    insert_under_mutex_query += insert_latest_account_states(txn);
-    insert_under_mutex_query += insert_traces(txn);
+    {
+      auto q = insert_latest_account_states(txn);
+      las_size = q.size();
+      insert_under_mutex_query += q;
+    }
+    {
+      auto q = insert_traces(txn);
+      traces_size = q.size();
+      insert_under_mutex_query += q;
+    }
+    under_mutex_size = insert_under_mutex_query.size();
+    build_ms = ms_since(t_build_start);
 
-    // execute queries
+    // execute queries under global mutex
+    auto t_mutex_wait_start = clock::now();
     {
       std::lock_guard<std::mutex> guard(latest_account_states_update_mutex);
+      mutex_wait_ms = ms_since(t_mutex_wait_start);
+
+      auto t_exec_start = clock::now();
       txn.exec0(insert_under_mutex_query);
+      mutex_exec_ms = ms_since(t_exec_start);
+
+      auto t_commit_start = clock::now();
       txn.commit();
+      commit_ms = ms_since(t_commit_start);
     }
 
     for(auto& task : insert_tasks_) {
       task.promise_.set_value(td::Unit());
     }
     promise_.set_value(td::Unit());
+
+    // batch composition
+    QueueState batch_state{};
+    for (auto& task : insert_tasks_) {
+      batch_state += task.get_queue_state();
+    }
+
+    LOG(INFO) << "InsertTiming: total=" << ms_since(t_start) << "ms"
+              << " conn=" << conn_ms
+              << " non_mutex=" << non_mutex_ms
+              << " build=" << build_ms
+              << " mutex_wait=" << mutex_wait_ms
+              << " mutex_exec=" << mutex_exec_ms
+              << " commit=" << commit_ms
+              << " | mb=" << batch_state.mc_blocks_
+              << " b=" << batch_state.blocks_
+              << " txs=" << batch_state.txs_
+              << " msgs=" << batch_state.msgs_
+              << " traces=" << batch_state.traces_
+              << " | under_mutex_kb=" << (under_mutex_size / 1024)
+              << " las_kb=" << (las_size / 1024)
+              << " traces_kb=" << (traces_size / 1024);
+
     stop();
     connection_errors_ = 0;
   } catch (const std::exception &e) {

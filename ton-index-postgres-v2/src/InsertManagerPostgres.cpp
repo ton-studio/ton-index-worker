@@ -157,15 +157,24 @@ void InsertBatchPostgres::alarm() {
       commit_ms = ms_since(t_commit_start);
     }
 
+    // batch composition + seqno range (for correlating TPS with workload shape)
+    QueueState batch_state{};
+    std::uint32_t min_mc_seqno = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t max_mc_seqno = 0;
+    for (auto& task : insert_tasks_) {
+      batch_state += task.get_queue_state();
+      if (task.mc_seqno_ < min_mc_seqno) min_mc_seqno = task.mc_seqno_;
+      if (task.mc_seqno_ > max_mc_seqno) max_mc_seqno = task.mc_seqno_;
+    }
+
     for(auto& task : insert_tasks_) {
       task.promise_.set_value(td::Unit());
     }
     promise_.set_value(td::Unit());
 
-    // batch composition (for correlating TPS with workload shape)
-    QueueState batch_state{};
-    for (auto& task : insert_tasks_) {
-      batch_state += task.get_queue_state();
+    std::string seqno_str = std::to_string(min_mc_seqno);
+    if (min_mc_seqno != max_mc_seqno) {
+      seqno_str += ".." + std::to_string(max_mc_seqno);
     }
 
     LOG(INFO) << "InsertTiming: total=" << ms_since(t_start) << "ms"
@@ -174,7 +183,8 @@ void InsertBatchPostgres::alarm() {
               << " mutex_wait=" << mutex_wait_ms
               << " exec=" << exec_ms
               << " commit=" << commit_ms
-              << " | mb=" << batch_state.mc_blocks_
+              << " | seqno=" << seqno_str
+              << " mb=" << batch_state.mc_blocks_
               << " b=" << batch_state.blocks_
               << " txs=" << batch_state.txs_
               << " msgs=" << batch_state.msgs_

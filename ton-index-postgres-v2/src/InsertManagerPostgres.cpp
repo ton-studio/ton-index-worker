@@ -1,4 +1,5 @@
 #include <mutex>
+#include <chrono>
 #include "td/utils/JsonBuilder.h"
 #include "InsertManagerPostgres.h"
 #include "convert-utils.h"
@@ -83,18 +84,29 @@ void InsertBatchPostgres::start_up() {
 
 
 void InsertBatchPostgres::alarm() {
+  using clock = std::chrono::steady_clock;
+  auto ms_since = [](clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+  };
+  auto t_start = clock::now();
+  std::int64_t conn_ms = 0, build_ms = 0, mutex_wait_ms = 0, exec_ms = 0, commit_ms = 0;
+  std::size_t full_size = 0, las_size = 0, traces_size = 0;
+
   try {
+    auto t_conn_start = clock::now();
     pqxx::connection c(connection_string_);
     if (!c.is_open()) {
       promise_.set_error(td::Status::Error(ErrorCode::DB_ERROR, "Failed to open database"));
       return;
     }
+    conn_ms = ms_since(t_conn_start);
 
     pqxx::work txn(c);
 
     // Build the full SQL text for this batch. Each insert_X helper now only
     // constructs SQL (no txn.exec0 inside), so the whole batch can be shipped
     // to Postgres in a single round-trip below.
+    auto t_build_start = clock::now();
     std::string full_query;
     full_query += insert_blocks(txn);
     full_query += insert_shard_state(txn);
@@ -114,23 +126,63 @@ void InsertBatchPostgres::alarm() {
     full_query += insert_nft_items(txn);
     full_query += insert_getgems_nft_auctions(txn);
     full_query += insert_getgems_nft_sales(txn);
-    full_query += insert_latest_account_states(txn);
-    full_query += insert_traces(txn);
+    {
+      auto q = insert_latest_account_states(txn);
+      las_size = q.size();
+      full_query += q;
+    }
+    {
+      auto q = insert_traces(txn);
+      traces_size = q.size();
+      full_query += q;
+    }
+    full_size = full_query.size();
+    build_ms = ms_since(t_build_start);
 
     // One exec + commit for the whole block. Mutex kept as a safety net in
     // case someone accidentally configures max-insert-actors > 1.
+    auto t_mutex_wait_start = clock::now();
     {
       std::lock_guard<std::mutex> guard(latest_account_states_update_mutex);
+      mutex_wait_ms = ms_since(t_mutex_wait_start);
+
+      auto t_exec_start = clock::now();
       if (!full_query.empty()) {
         txn.exec0(full_query);
       }
+      exec_ms = ms_since(t_exec_start);
+
+      auto t_commit_start = clock::now();
       txn.commit();
+      commit_ms = ms_since(t_commit_start);
     }
 
     for(auto& task : insert_tasks_) {
       task.promise_.set_value(td::Unit());
     }
     promise_.set_value(td::Unit());
+
+    // batch composition (for correlating TPS with workload shape)
+    QueueState batch_state{};
+    for (auto& task : insert_tasks_) {
+      batch_state += task.get_queue_state();
+    }
+
+    LOG(INFO) << "InsertTiming: total=" << ms_since(t_start) << "ms"
+              << " conn=" << conn_ms
+              << " build=" << build_ms
+              << " mutex_wait=" << mutex_wait_ms
+              << " exec=" << exec_ms
+              << " commit=" << commit_ms
+              << " | mb=" << batch_state.mc_blocks_
+              << " b=" << batch_state.blocks_
+              << " txs=" << batch_state.txs_
+              << " msgs=" << batch_state.msgs_
+              << " traces=" << batch_state.traces_
+              << " | full_kb=" << (full_size / 1024)
+              << " las_kb=" << (las_size / 1024)
+              << " traces_kb=" << (traces_size / 1024);
+
     stop();
     connection_errors_ = 0;
   } catch (const std::exception &e) {

@@ -1125,6 +1125,22 @@ std::string InsertBatchPostgres::insert_latest_account_states(pqxx::work &txn) {
                                               "account_status, timestamp, last_trans_hash, last_trans_lt, "
                                               "frozen_hash, data_hash, code_hash, "
                                               "data_boc, code_boc) VALUES ";
+  // Per-batch telemetry for TETL-057: split std_boc_serialize / base64 / quote
+  // for each account's data_boc, so we can tell whether the 320s "build" phase
+  // sits in the cell serializer (possible RocksDB IO on Ref<Cell>::load_cell)
+  // or in the encoding pipeline. Also emit a summary once per LAS batch.
+  using las_clock = std::chrono::steady_clock;
+  auto las_ms_since = [](las_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+             las_clock::now() - t0).count();
+  };
+  int las_heavy_count = 0;
+  std::int64_t las_data_boc_ms = 0;
+  std::int64_t las_data_b64_ms = 0;
+  std::int64_t las_data_quote_ms = 0;
+  std::int64_t las_code_ms = 0;
+  std::size_t las_data_bytes_total = 0;
+
   bool is_first = true;
   for (auto i = latest_account_states.begin(); i != latest_account_states.end(); ++i) {
     auto& account_state = i->second;
@@ -1137,21 +1153,50 @@ std::string InsertBatchPostgres::insert_latest_account_states(pqxx::work &txn) {
     std::string data_str = "NULL";
 
     if (max_data_depth_ >= 0 && account_state.data.not_null() && (max_data_depth_ == 0 || account_state.data->get_depth() <= max_data_depth_)){
+      auto t_boc = las_clock::now();
       auto data_res = vm::std_boc_serialize(account_state.data);
+      auto boc_ms = las_ms_since(t_boc);
+      las_data_boc_ms += boc_ms;
       if (data_res.is_ok()){
-        data_str = txn.quote(td::base64_encode(data_res.move_as_ok().as_slice().str()));
+        auto raw = data_res.move_as_ok().as_slice().str();
+        std::size_t data_bytes = raw.size();
+        las_data_bytes_total += data_bytes;
+
+        auto t_b64 = las_clock::now();
+        auto encoded = td::base64_encode(raw);
+        auto b64_ms = las_ms_since(t_b64);
+        las_data_b64_ms += b64_ms;
+
+        auto t_quote = las_clock::now();
+        data_str = txn.quote(encoded);
+        auto quote_ms = las_ms_since(t_quote);
+        las_data_quote_ms += quote_ms;
+
+        std::int64_t total_ms = boc_ms + b64_ms + quote_ms;
+        if (total_ms > 500) {
+          ++las_heavy_count;
+          LOG(WARNING) << "LasHeavyBoc: addr=" << convert::to_raw_address(account_state.account)
+                       << " data_bytes=" << data_bytes
+                       << " depth=" << account_state.data->get_depth()
+                       << " boc_ms=" << boc_ms
+                       << " b64_ms=" << b64_ms
+                       << " quote_ms=" << quote_ms
+                       << " total_ms=" << total_ms;
+        }
       }
     } else {
       if (account_state.data.not_null()) {
-        LOG(DEBUG) << "Large account data: " << account_state.account 
+        LOG(DEBUG) << "Large account data: " << account_state.account
                   << " Depth: " << account_state.data->get_depth();
       }
     }
     {
+      auto t_code = las_clock::now();
       auto code_res = vm::std_boc_serialize(account_state.code);
       if (code_res.is_ok()){
         code_str = txn.quote(td::base64_encode(code_res.move_as_ok().as_slice().str()));
       }
+      las_code_ms += las_ms_since(t_code);
       if (code_str.length() > 128000) {
         LOG(ERROR) << "Large account code:" << account_state.account;
       }
@@ -1200,6 +1245,13 @@ std::string InsertBatchPostgres::insert_latest_account_states(pqxx::work &txn) {
         << "data_boc = EXCLUDED.data_boc, "
         << "code_boc = EXCLUDED.code_boc;\n";
   // LOG(INFO) << "Latest account states query size: " << double(query.str().length()) / 1024 / 1024;
+  LOG(INFO) << "LasBocSummary: accounts=" << latest_account_states.size()
+            << " heavy=" << las_heavy_count
+            << " data_bytes_total=" << las_data_bytes_total
+            << " data_boc_ms=" << las_data_boc_ms
+            << " data_b64_ms=" << las_data_b64_ms
+            << " data_quote_ms=" << las_data_quote_ms
+            << " code_total_ms=" << las_code_ms;
   return query.str();
 }
 
